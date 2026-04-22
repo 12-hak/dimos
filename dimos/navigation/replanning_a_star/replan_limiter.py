@@ -26,16 +26,18 @@ class ReplanLimiter:
     the area, the number of attempts is reset.
     """
 
-    _max_attempts: int = 6
-    _reset_distance: float = 2.0
+    _max_attempts: int
+    _reset_distance: float
     _attempt_pos: Vector3 | None = None
     _lock: RLock
 
     _attempt: int
 
-    def __init__(self) -> None:
+    def __init__(self, max_attempts: int = 15, reset_distance_m: float = 1.5) -> None:
         self._lock = RLock()
         self._attempt = 0
+        self._max_attempts = max_attempts
+        self._reset_distance = reset_distance_m
 
     def can_retry(self, position: Vector3) -> bool:
         with self._lock:

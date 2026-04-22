@@ -53,6 +53,13 @@ class GlobalConfig(BaseSettings):
     mcp_host: str = "0.0.0.0"
     dtop: bool = False
     obstacle_avoidance: bool = True
+    blocked_movement_seconds: float = 8.0
+    stuck_recovery_reverse_seconds: float = 0.75
+    stuck_recovery_linear_x: float = -0.25
+    path_obstacle_cost_threshold: int | None = None
+    replan_max_attempts: int = 15
+    replan_attempt_reset_distance_m: float = 1.5
+    replan_mission_time_limit_s: float = 300.0
     detection_model: VlModelName = "moondream"
 
     model_config = SettingsConfigDict(

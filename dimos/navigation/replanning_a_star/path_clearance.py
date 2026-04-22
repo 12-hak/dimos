@@ -86,7 +86,11 @@ class PathClearance:
         if costmap is None:
             return True
 
-        return bool(np.any(costmap.grid[self.mask] == CostValues.OCCUPIED))
+        cells = costmap.grid[self.mask]
+        thr = self._global_config.path_obstacle_cost_threshold
+        if thr is None:
+            return bool(np.any(cells == CostValues.OCCUPIED))
+        return bool(np.any((cells >= thr) & (cells != CostValues.UNKNOWN)))
 
     def _pose_distance(self, index1: int, index2: int) -> float:
         p1 = self._path.poses[index1].position

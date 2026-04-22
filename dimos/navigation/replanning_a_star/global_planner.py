@@ -66,7 +66,6 @@ class GlobalPlanner(Resource):
     _rotation_tolerance: float = math.radians(15)
     _replan_goal_tolerance: float = 0.5
     _max_replan_attempts: int = 10
-    _stuck_time_window: float = 8.0
     _max_path_deviation: float = 0.9
 
     def __init__(self, global_config: GlobalConfig) -> None:
@@ -78,13 +77,19 @@ class GlobalPlanner(Resource):
         self._local_planner = LocalPlanner(
             self._global_config, self._navigation_map, self._goal_tolerance
         )
-        self._position_tracker = PositionTracker(self._stuck_time_window)
-        self._replan_limiter = ReplanLimiter()
+        self._position_tracker = PositionTracker(global_config.blocked_movement_seconds)
+        self._replan_limiter = ReplanLimiter(
+            max_attempts=global_config.replan_max_attempts,
+            reset_distance_m=global_config.replan_attempt_reset_distance_m,
+        )
         self._disposables = CompositeDisposable()
         self._stop_planner = Event()
         self._replan_event = Event()
         self._replan_reason = None
         self._lock = RLock()
+        self._mission_start_mono: float | None = None
+        self._retry_plan_after_failure: bool = False
+        self._last_failed_plan_retry_mono: float = 0.0
 
     def start(self) -> None:
         self._local_planner.start()
@@ -123,6 +128,9 @@ class GlobalPlanner(Resource):
         with self._lock:
             self._current_goal = goal
             self._goal_reached = False
+            self._mission_start_mono = time.monotonic()
+            self._retry_plan_after_failure = False
+            self._last_failed_plan_retry_mono = 0.0
         self._replan_limiter.reset()
         self._plan_path()
 
@@ -136,8 +144,11 @@ class GlobalPlanner(Resource):
                 self._current_goal = None
                 self._goal_reached = arrived
                 self._replan_limiter.reset()
+                self._mission_start_mono = None
+                self._retry_plan_after_failure = False
 
-        self.path.on_next(Path())
+        if not but_will_try_again:
+            self.path.on_next(Path())
         self._local_planner.stop_planning()
 
         if not but_will_try_again:
@@ -157,6 +168,16 @@ class GlobalPlanner(Resource):
     @property
     def navigation_costmap(self) -> Subject[OccupancyGrid]:
         return self._local_planner.navigation_costmap
+
+    def _mission_time_exceeded(self) -> bool:
+        limit = self._global_config.replan_mission_time_limit_s
+        if limit <= 0:
+            return False
+        with self._lock:
+            start = self._mission_start_mono
+        if start is None:
+            return False
+        return time.monotonic() - start >= limit
 
     def _thread_entrypoint(self) -> None:
         """Monitor if the robot is stuck, veers off track, or stopped navigating."""
@@ -182,6 +203,31 @@ class GlobalPlanner(Resource):
                     self._handle_stop_message(reason)
                     last_stuck_check = time.perf_counter()
                     continue
+
+            with self._lock:
+                pending_fail = self._retry_plan_after_failure
+                current_goal = self._current_goal
+                current_odom = self._current_odom
+
+            if pending_fail and current_goal:
+                if self._mission_time_exceeded():
+                    logger.info("Mission time budget exhausted during plan retries.")
+                    with self._lock:
+                        self._retry_plan_after_failure = False
+                    self.cancel_goal()
+                    continue
+                now = time.monotonic()
+                if now - self._last_failed_plan_retry_mono >= 0.4:
+                    self._last_failed_plan_retry_mono = now
+                    with self._lock:
+                        self._retry_plan_after_failure = False
+                    logger.info("Plan search failed; recovery + retry toward goal.")
+                    self._local_planner.stop_planning()
+                    self._pulse_smart_recovery()
+                    self._plan_path()
+                    last_stuck_check = time.perf_counter()
+                    continue
+                continue
 
             with self._lock:
                 current_goal = self._current_goal
@@ -221,12 +267,150 @@ class GlobalPlanner(Resource):
                 continue
 
             if (
-                time.perf_counter() - last_stuck_check > self._stuck_time_window
+                time.perf_counter() - last_stuck_check > self._global_config.blocked_movement_seconds
                 and self._position_tracker.is_stuck()
             ):
-                logger.info("Robot is stuck. Replanning.")
+                logger.info("Robot is stuck. Recovering then replanning.")
+                self._local_planner.stop_planning()
+                self._pulse_smart_recovery()
                 self._replan_path()
                 last_stuck_check = time.perf_counter()
+
+    def _cell_blocks_recovery(self, value: int) -> bool:
+        if value == CostValues.OCCUPIED:
+            return True
+        thr = self._global_config.path_obstacle_cost_threshold
+        if thr is not None and value >= thr:
+            return True
+        return False
+
+    def _corridor_clear(
+        self,
+        costmap: OccupancyGrid,
+        wx: float,
+        wy: float,
+        dir_x: float,
+        dir_y: float,
+        length_m: float,
+        lateral_m: float,
+        n_steps: int,
+    ) -> bool:
+        length = math.hypot(dir_x, dir_y)
+        if length < 1e-6:
+            return False
+        ux, uy = dir_x / length, dir_y / length
+        px, py = -uy, ux
+        for step in range(1, n_steps + 1):
+            t = (length_m / n_steps) * step
+            for side in (-1.0, 0.0, 1.0):
+                sx = wx + ux * t + px * side * lateral_m
+                sy = wy + uy * t + py * side * lateral_m
+                v = costmap.cell_value(Vector3(sx, sy, 0.0))
+                if self._cell_blocks_recovery(v):
+                    return False
+        return True
+
+    def _pulse_cmd_for(self, duration: float, linear_x: float, angular_z: float) -> None:
+        if duration <= 0:
+            return
+        twist = Twist(
+            linear=Vector3(x=linear_x, y=0.0, z=0.0),
+            angular=Vector3(x=0.0, y=0.0, z=angular_z),
+        )
+        deadline = time.perf_counter() + duration
+        while time.perf_counter() < deadline:
+            self._local_planner.cmd_vel.on_next(twist)
+            time.sleep(0.05)
+        self._local_planner.cmd_vel.on_next(Twist())
+
+    def _pulse_smart_recovery(self) -> None:
+        duration = self._global_config.stuck_recovery_reverse_seconds
+        if duration <= 0:
+            return
+
+        lv = float(self._global_config.stuck_recovery_linear_x)
+        with self._lock:
+            odom = self._current_odom
+
+        try:
+            costmap = self._navigation_map.binary_costmap
+        except ValueError:
+            costmap = None
+
+        if odom is None or costmap is None or costmap.grid.size == 0:
+            self._pulse_cmd_for(duration, lv, 0.0)
+            return
+
+        yaw = odom.orientation.euler[2]
+        wx, wy = float(odom.position.x), float(odom.position.y)
+
+        bx = math.cos(yaw + math.pi)
+        by = math.sin(yaw + math.pi)
+
+        def rot(vx: float, vy: float, delta: float) -> tuple[float, float]:
+            c, s = math.cos(delta), math.sin(delta)
+            return vx * c - vy * s, vx * s + vy * c
+
+        lx_b, ly_b = rot(bx, by, 0.45)
+        rx_b, ry_b = rot(bx, by, -0.45)
+
+        straight_ok = self._corridor_clear(costmap, wx, wy, bx, by, 0.52, 0.14, 5)
+        left_arc_ok = self._corridor_clear(costmap, wx, wy, lx_b, ly_b, 0.48, 0.14, 5)
+        right_arc_ok = self._corridor_clear(costmap, wx, wy, rx_b, ry_b, 0.48, 0.14, 5)
+
+        lyaw = yaw + math.pi / 2
+        ryaw = yaw - math.pi / 2
+        lx_f, ly_f = math.cos(lyaw), math.sin(lyaw)
+        rx_f, ry_f = math.cos(ryaw), math.sin(ryaw)
+        rot_left_clear = self._corridor_clear(costmap, wx, wy, lx_f, ly_f, 0.38, 0.12, 4)
+        rot_right_clear = self._corridor_clear(costmap, wx, wy, rx_f, ry_f, 0.38, 0.12, 4)
+
+        if straight_ok:
+            logger.info("Recovery: straight reverse.")
+            self._pulse_cmd_for(duration, lv, 0.0)
+            return
+
+        if left_arc_ok:
+            logger.info("Recovery: reverse with left arc (clearance behind-left).")
+            self._pulse_cmd_for(duration, lv * 0.78, 0.42)
+            return
+
+        if right_arc_ok:
+            logger.info("Recovery: reverse with right arc (clearance behind-right).")
+            self._pulse_cmd_for(duration, lv * 0.78, -0.42)
+            return
+
+        rot_part = min(0.55, duration * 0.65)
+        rest = max(0.0, duration - rot_part)
+
+        if rot_left_clear and not rot_right_clear:
+            logger.info("Recovery: rotate left in place (side clearance).")
+            self._pulse_cmd_for(rot_part, 0.0, 0.48)
+            if rest > 0:
+                self._pulse_cmd_for(rest, lv * 0.62, 0.32)
+            return
+
+        if rot_right_clear and not rot_left_clear:
+            logger.info("Recovery: rotate right in place (side clearance).")
+            self._pulse_cmd_for(rot_part, 0.0, -0.48)
+            if rest > 0:
+                self._pulse_cmd_for(rest, lv * 0.62, -0.32)
+            return
+
+        if rot_left_clear:
+            logger.info("Recovery: rotate left then short reverse arc.")
+            self._pulse_cmd_for(rot_part, 0.0, 0.42)
+            self._pulse_cmd_for(rest, lv * 0.65, 0.38)
+            return
+
+        if rot_right_clear:
+            logger.info("Recovery: rotate right then short reverse arc.")
+            self._pulse_cmd_for(rot_part, 0.0, -0.42)
+            self._pulse_cmd_for(rest, lv * 0.65, -0.38)
+            return
+
+        logger.info("Recovery: tight space — short skewed reverse.")
+        self._pulse_cmd_for(duration * 0.85, lv * 0.55, 0.35)
 
     def _on_stopped_navigating(self, stop_message: StopMessage) -> None:
         with self._lock:
@@ -238,20 +422,29 @@ class GlobalPlanner(Resource):
     def _handle_stop_message(self, stop_message: StopMessage) -> None:
         # Note, this runs in the monitoring thread.
 
-        self.path.on_next(Path())
-
         if stop_message == "arrived":
+            self.path.on_next(Path())
             logger.info("Arrived at goal.")
             self.cancel_goal(arrived=True)
-        elif stop_message == "obstacle_found":
-            logger.info("Replanning path due to obstacle found.")
+            return
+
+        if stop_message == "obstacle_found":
+            logger.info("Obstacle ahead; recovering then replanning toward goal.")
+            self._local_planner.stop_planning()
+            self._pulse_smart_recovery()
             self._replan_path()
-        elif stop_message == "error":
-            logger.info("Failure in navigation.")
+            return
+
+        if stop_message == "error":
+            logger.info("Navigation error; recovering then replanning.")
+            self._local_planner.stop_planning()
+            self._pulse_smart_recovery()
             self._replan_path()
-        else:
-            logger.error(f"No code to handle '{stop_message}'.")
-            self.cancel_goal()
+            return
+
+        logger.error(f"No code to handle '{stop_message}'.")
+        self.path.on_next(Path())
+        self.cancel_goal()
 
     def _replan_path(self) -> None:
         with self._lock:
@@ -267,13 +460,27 @@ class GlobalPlanner(Resource):
             self.cancel_goal(arrived=True)
             return
 
-        if not self._replan_limiter.can_retry(current_odom.position):
+        if self._mission_time_exceeded():
+            logger.info("Mission time budget exhausted; stopping navigation.")
             self.cancel_goal()
             return
+
+        if not self._replan_limiter.can_retry(current_odom.position):
+            logger.info(
+                "Replanner attempt cap for this zone; continuing while mission time remains."
+            )
 
         self._replan_limiter.will_retry()
 
         self._plan_path()
+
+    def _register_plan_failure_for_retry(self) -> None:
+        if self._mission_time_exceeded():
+            logger.info("No valid path and mission time expired.")
+            self.cancel_goal()
+            return
+        with self._lock:
+            self._retry_plan_after_failure = True
 
     def _plan_path(self) -> None:
         self.cancel_goal(but_will_try_again=True)
@@ -291,6 +498,8 @@ class GlobalPlanner(Resource):
         safe_goal = self._find_safe_goal(current_goal.position)
 
         if not safe_goal:
+            logger.warning("No safe goal near target; scheduling retry.")
+            self._register_plan_failure_for_retry()
             return
 
         path = self._find_wide_path(safe_goal, current_odom.position)
@@ -299,7 +508,11 @@ class GlobalPlanner(Resource):
             logger.warning(
                 "No path found to the goal.", x=round(safe_goal.x, 3), y=round(safe_goal.y, 3)
             )
+            self._register_plan_failure_for_retry()
             return
+
+        with self._lock:
+            self._retry_plan_after_failure = False
 
         resampled_path = smooth_resample_path(path, current_goal, 0.1)
 
@@ -308,8 +521,7 @@ class GlobalPlanner(Resource):
         self._local_planner.start_planning(resampled_path)
 
     def _find_wide_path(self, goal: Vector3, robot_pos: Vector3) -> Path | None:
-        #        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1]
-        sizes_to_try: list[float] = [1.1]
+        sizes_to_try: list[float] = [1.1, 1.45, 1.85, 2.3]
 
         for size in sizes_to_try:
             costmap = self._navigation_map.make_gradient_costmap(size)
